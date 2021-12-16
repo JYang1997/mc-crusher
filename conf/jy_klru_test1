@@ -1,0 +1,1 @@
+send=ascii_set,recv=blind_read,conns=24,thread=20,key_prefix=slab1:,value_size=1000,key_count=600000,key_prealloc=0

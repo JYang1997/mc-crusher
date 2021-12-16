@@ -521,11 +521,26 @@ static void read_from_client(void *arg) {
             } else {
                 perror("Read error from client");
             }
+        }else{
+             printf("\n\njunyaoy %s, %d\n\n", c->t->shared_rbuf, rbytes);
+            //junyaoy 12/10/2021
+            //here identify type of connection first
+            //if it ascci_get
+            //then send set on miss
+            //conn->tshared->key_prefix
+            memset(c->t->shared_rbuf,0,(size_t)rbytes);
         }
+       
         if (rbytes < READ_MIN)
             break; /* don't call read() again unless we may get data */
+        //junyaoy 12/10/2021 test
+        
     }
 }
+
+//junyaoy 12/16/2021
+//setback_reader function
+
 
 /* === HANDLERS === */
 
