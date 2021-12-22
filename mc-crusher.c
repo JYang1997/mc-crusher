@@ -53,6 +53,13 @@
 
 #define SHARED_RBUF_SIZE 1024 * 64
 #define SHARED_VALUE_SIZE 1024 * 1024
+
+//junyaoy 12/20/2021
+#define RBUF_SIZE 1024 * 64
+#define WBUF_SIZE 1024 * 64
+#define VALUE_MAX_SIZE 1024 * 1024
+#define HIT 0
+#define MISS 1
 // avoiding some hacks for finding member size.
 #define SOCK_MAX 100
 
@@ -69,6 +76,9 @@ enum conn_states {
     conn_sending,
     conn_reading,
     conn_sleeping,
+    //junyaoy 12/20/2021
+    //new state for setback purpose
+    conn_setback_reading
 };
 
 enum conn_rand {
@@ -92,8 +102,9 @@ typedef struct _mc_tshared {
     size_t key_prefix_len;
     size_t cmd_postfix_len;
     unsigned char key_prefix[284];
+    unsigned char second_key_prefix[284]; //this is used for setback //junyaoy 12/16/2021
     unsigned char cmd_postfix[1024];
-    unsigned char value[2048];     /* manually specified seed value */
+    unsigned char value[VALUE_MAX_SIZE];     /* manually specified seed value */
 } mc_tshared;
 
 struct connection {
@@ -124,6 +135,9 @@ struct connection {
     int wbuf_towrite;
     uint32_t expire;
     uint32_t flags;
+    /*junyaoy 
+      for setback purpose, record hit or miss*/
+    int read_info;
 
     uint64_t pipelines; /* number of repeated commands per write */
     int usleep; /* us to sleep between write runs */
@@ -143,17 +157,27 @@ struct connection {
     /* time pacing */
     struct timeval next_sleep;
     struct timeval tosleep;
-
+    
+    //junyaoy change reader return to void*
     /* reader/writer function pointers */
     void (*writer)(void *arg);
     void (*reader)(void *arg);
+  
 
     /* helper function specific to the generic ascii writer */
     int (*ascii_format)(struct connection *c);
     int (*bin_format)(struct connection *c);
     int (*bin_prep_cmd)(struct connection *c);
-    unsigned char wbuf[65536]; // putting this at the end to get more of the above into fewer cachelines.
+    //junyaoy 12/016/2021  per connection buffer, used for setback
+    unsigned char rbuf[RBUF_SIZE]; //check server return content to identify miss
+    unsigned char wbuf[WBUF_SIZE]; // putting this at the end to get more of the above into fewer cachelines.
 };
+
+
+/*junyaoy 12/20/2021 modified prototype**/
+static void ascii_write_flat_to_client_noupdate(void *arg);
+static inline void run_setback_write(struct connection *c);
+static void setback_read_from_client(void *arg);
 
 static void client_handler(const int fd, const short which, void *arg);
 static void sleep_handler(const int fd, const short which, void *arg);
@@ -412,6 +436,9 @@ static void ascii_write_flat_mget_to_client(void *arg) {
     c->wbuf_pos += 2;
 }
 
+
+
+
 static int ascii_set_format(struct connection *c) {
     char *p = c->wbuf_pos;
     memcpy(p, c->s->key_prefix, c->s->key_prefix_len);
@@ -453,6 +480,7 @@ static int ascii_touch_format(struct connection *c) {
 static int ascii_single_format(struct connection *c) {
     char *p = c->wbuf_pos;
     memcpy(p, c->s->key_prefix, c->s->key_prefix_len);
+    // printf("write: %c%c%c\n",p[0],p[1],p[2]);
     p = itoa_u64(*c->cur_key, p + c->s->key_prefix_len);
     *p = ' ';
     *(p+1) = '\r';
@@ -477,6 +505,27 @@ static int ascii_metacmd_format(struct connection *c) {
     return (p - (char *)c->wbuf_pos) + 2;
 }
 
+
+//junyaoy 12/16/2021
+static int ascii_getset_format(struct connection *c) {
+ 
+        //this is not a good check
+        //consider buff per connection or use flag later
+        char *p = c->wbuf_pos;
+        memcpy(p, c->s->second_key_prefix, c->s->key_prefix_len);
+        p = itoa_u64(*c->cur_key, p + c->s->key_prefix_len);
+        *p = ' ';
+        p = itoa_u32(c->flags, p+1);
+        *p = ' ';
+        p = itoa_u32(c->expire, p+1);
+        *p = ' ';
+        p = itoa_u32(c->value_size, p+1);
+        *p = '\r';
+        *(p+1) = '\n';
+        return (p - (char *)c->wbuf_pos) + 2;
+   
+}
+
 // for fast-writing to wbuf
 // WARNING: sets can easily blow this up :(
 static void ascii_write_flat_to_client(void *arg) {
@@ -496,6 +545,23 @@ static void ascii_write_flat_to_client(void *arg) {
     run_counter(c);
 }
 
+
+static void ascii_write_flat_to_client_noupdate(void *arg) {
+    struct connection *c = arg;
+    c->wbuf_pos += c->ascii_format(c);
+    if (c->value_size && c->read_info==MISS) {
+        if (c->use_shared_value) {
+            memcpy(c->wbuf_pos, c->t->shared_value, c->value_size);
+        } else {
+            memcpy(c->wbuf_pos, c->s->value, c->value_size);
+        }
+        c->wbuf_pos += c->value_size;
+        c->wbuf_pos[0] = '\r';
+        c->wbuf_pos[1] = '\n';
+        c->wbuf_pos += 2;
+    }
+}
+
 /* === READERS === */
 // Seems like leaving some data in SSL_read causes wobbles in performance.
 // SSL_read() returns after each individual TLS frame read, not with a full read
@@ -511,24 +577,17 @@ static void read_from_client(void *arg) {
     int rbytes = 0;
     for (;;) {
 #ifdef USE_TLS
-        rbytes = SSL_read(c->ssl, c->t->shared_rbuf, SHARED_RBUF_SIZE);
+        rbytes = SSL_read(c->ssl, c->rbuf, RBUF_SIZE);
 #else
-        rbytes = read(c->fd, c->t->shared_rbuf, SHARED_RBUF_SIZE);
+        rbytes = read(c->fd, c->rbuf, RBUF_SIZE);
 #endif
         if (rbytes == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                exit(-1);
                 break;
             } else {
                 perror("Read error from client");
             }
-        }else{
-             printf("\n\njunyaoy %s, %d\n\n", c->t->shared_rbuf, rbytes);
-            //junyaoy 12/10/2021
-            //here identify type of connection first
-            //if it ascci_get
-            //then send set on miss
-            //conn->tshared->key_prefix
-            memset(c->t->shared_rbuf,0,(size_t)rbytes);
         }
        
         if (rbytes < READ_MIN)
@@ -538,8 +597,122 @@ static void read_from_client(void *arg) {
     }
 }
 
+//junyaoy 12/06/1997
+static inline void run_setback_write(struct connection *c) {
+    int i;
+    c->wbuf_pos = c->wbuf;
+   
+    c->wbuf_pos += ascii_getset_format(c);
+    if (c->value_size) {
+        if (c->use_shared_value) {
+            memcpy(c->wbuf_pos, c->t->shared_value, c->value_size);
+        } else {
+            memcpy(c->wbuf_pos, c->s->value, c->value_size);
+        }
+        c->wbuf_pos += c->value_size;
+        c->wbuf_pos[0] = '\r';
+        c->wbuf_pos[1] = '\n';
+        c->wbuf_pos += 2;
+
+    //    printf("write: %.100sdone\n",c->wbuf);
+    }
+    {
+        // not using iovecs, save some libc/kernel looping.
+        c->wbuf_towrite = c->wbuf_pos - (unsigned char *)&c->wbuf;
+        c->wbuf_written = 0;
+        //fprintf(stderr, "WBUF towrite: %d\n", c->wbuf_towrite);
+        int count = 0;
+        int fuck = 0;
+        for(;;) {
+            int written = 0;
+            #ifdef USE_TLS
+                written = SSL_write(c->ssl, c->wbuf + c->wbuf_written, c->wbuf_towrite);
+            #else   
+                written = write(c->fd, c->wbuf + c->wbuf_written, c->wbuf_towrite);
+            #endif
+
+
+          //      printf("\nwritten: %d count:%d towrite:%d\n", written, fuck++, c->wbuf_towrite);
+                
+                if(written == -1) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        count++;
+                        if (count < 11){
+                            continue;
+                        }else{
+                            break;
+                        }
+                    } else {
+                        perror("Write error to client");
+                        exit(1);
+                        return;
+                    }
+                }else{
+
+
+                    c->wbuf_towrite -= written;
+                    c->wbuf_written += written;
+                    if(c->wbuf_towrite <= 0) {
+                        c->state = c->next_state;
+                        update_conn_event(c, EV_READ | EV_PERSIST);
+                        return;
+                    }else{
+                        continue;
+                    }
+                }
+
+              
+
+        }
+    }
+}
+
+
+
 //junyaoy 12/16/2021
 //setback_reader function
+static void setback_read_from_client(void *arg) {
+    struct connection *c = arg;
+    int rbytes = 0;
+    int count = 0;
+    for (;;) {
+#ifdef USE_TLS
+        rbytes = SSL_read(c->ssl, c->rbuf, RBUF_SIZE);
+#else
+        rbytes = read(c->fd, c->rbuf, RBUF_SIZE);
+#endif
+        if (rbytes == -1) {
+         
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                count++;
+                if(count < 11)
+                    continue; //get miss/hit info //after 10 times stop
+                else
+                    break;
+            } else {
+                perror("Read error from client");
+            }
+        }else{
+    //        printf("rbuf:%.100s, size:%d\n",c->rbuf,rbytes);
+            if (strncmp(c->rbuf, "END",3) == 0) {
+                memset(c->rbuf,0,(size_t)RBUF_SIZE);
+                c->read_info = MISS;
+                return;         
+            }
+            memset(c->rbuf,0,(size_t)RBUF_SIZE);
+            break;
+        }
+       
+        if (rbytes < READ_MIN)
+            break; /* don't call read() again unless we may get data */
+        
+    }
+
+    //update counter infomation, after know it is hit
+    run_counter(c); 
+    c->read_info = HIT;
+    return;
+}
 
 
 /* === HANDLERS === */
@@ -554,8 +727,14 @@ static void sleep_handler(const int fd, const short which, void *arg) {
 static inline void run_write(struct connection *c) {
     int i;
     c->wbuf_pos = c->wbuf;
+    //set up bufer, for actual write
+    //curr key also updated after filled the buffer
+    //*we need to set up the set back command here 
+    //so on miss, we can fire this
+    //
     for (i = 0; i < c->pipelines; i++) {
         c->writer(c);
+    //    printf("write: %.100sdone\n",c->wbuf);
     }
     {
         // not using iovecs, save some libc/kernel looping.
@@ -570,11 +749,12 @@ static inline void run_write(struct connection *c) {
 }
 
 static void client_handler(const int fd, const short which, void *arg) {
+    int ret_info;//junyaoy 12/20/2021 check hit/miss
     struct connection *c = (struct connection *)arg;
     int err = 0;
     socklen_t errsize = sizeof(err);
     int written = 0;
-
+   // printf("\n\n\n\nwrite count: %llu\n", *c->write_count); 
     switch (c->state) {
     case conn_connecting:
         if (getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &errsize) < 0) {
@@ -585,11 +765,16 @@ static void client_handler(const int fd, const short which, void *arg) {
         }
         c->state = conn_sending;
         update_conn_event(c, EV_READ | EV_PERSIST);
+       
     case conn_sending:
         if (which & EV_READ) {
             c->reader(c);
         }
+
+       
         if (which & EV_WRITE) {
+
+            //if last write field,attempt to write it first
             if (c->wbuf_towrite) {
                 write_flat(c, c->next_state);
             }
@@ -601,9 +786,27 @@ static void client_handler(const int fd, const short which, void *arg) {
         break;
     case conn_reading:
         c->reader(c);
+
         c->state = conn_sending;
-        if (c->wbuf_towrite <= 0)
+        if (c->wbuf_towrite <= 0){
             run_write(c);
+        }
+        break;
+    case conn_setback_reading:
+        c->reader(c);
+  //      printf("to_write: %d, flag: %d\n",c->wbuf_towrite, which);
+        if(c->read_info == HIT){
+    //        printf("\nhit\n");
+            c->state = conn_sending;
+            if (c->wbuf_towrite <= 0){
+                run_write(c);
+            }
+        }else{
+      //      printf("\nmiss\n");
+            //setback
+            run_setback_write(c);
+            
+        }
         break;
     }
 }
@@ -794,6 +997,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
     int i, x;
     char *tmp;
     char *sender = NULL;
+    char *reader = NULL;
     int add_space = 0;
     int new_thread = 0;
     char key_prefix_tmp[270];
@@ -880,6 +1084,8 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
     template.next_state = conn_reading;
     template.s = calloc(1, sizeof(mc_tshared));
     template.s->value[0] = '\0';
+    
+    template.read_info = HIT;
 
     /* Chomp the ending newline */
     tmp = rindex(line, '\n');
@@ -905,6 +1111,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
             sender = value;
             break;
         case RECV:
+            reader = value;
             template.reader = read_from_client;
             break;
         case CONNS:
@@ -969,7 +1176,15 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
         }
     }
 
-    if (strcmp(sender, "ascii_get") == 0) {
+   
+    if (strcmp(sender, "ascii_getset") == 0) {
+        template.writer = ascii_write_flat_to_client_noupdate;
+        template.ascii_format = ascii_single_format;
+        sprintf(template.s->key_prefix, "get %s", key_prefix_tmp);
+        sprintf(template.s->second_key_prefix, "set %s", key_prefix_tmp);
+        template.reader = setback_read_from_client;
+        template.next_state = conn_setback_reading;
+    } else if (strcmp(sender, "ascii_get") == 0) {
         template.writer = ascii_write_flat_to_client;
         template.ascii_format = ascii_single_format;
         sprintf(template.s->key_prefix, "get %s", key_prefix_tmp);
