@@ -1,6 +1,8 @@
 {
     "files.associations": {
         "limits": "c",
-        "type_traits": "c"
+        "type_traits": "c",
+        "cstdlib": "c",
+        "event.h": "c"
     }
 }

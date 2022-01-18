@@ -12,7 +12,20 @@
  *  Authors:
  *      dormando <dormando@rydia.net>
  */
-
+/*
+ * basic logic for replay real workload:
+ *      read workload into a giant global buffer
+ *      each thread keeps unique index on global buffer
+ *      upon completion of current request, the thread
+ *      increment the counter. when counter end it wrap back
+ *      to beginning of the buffer.
+ * 
+ *      1. add path and workload replay flag
+ *      2. add workload to buffer during initialization
+ *      3. modified "run_counter"
+ *      4. add workload buffer index to each connections
+ *      
+ */
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -50,6 +63,7 @@
 #include "protocol_binary.h"
 #include "pcg-basic.h"
 #include "itoa_ljust.h"
+#include "murmur3.h" //junyaoy 01/13/2022
 
 #define SHARED_RBUF_SIZE 1024 * 64
 #define SHARED_VALUE_SIZE 1024 * 1024
@@ -60,13 +74,30 @@
 #define VALUE_MAX_SIZE 1024 * 1024
 #define HIT 0
 #define MISS 1
+//junyaoy 01/13/2022
+#define INDEX_INIT_INTERVAL 40000
+
 // avoiding some hacks for finding member size.
 #define SOCK_MAX 100
+
+
 
 char host_default[NI_MAXHOST] = "127.0.0.1";
 char port_num_default[NI_MAXSERV] = "11211";
 char sock_path_default[SOCK_MAX];
 int alarm_fired = 0;
+
+//junyaoy 01/13/2022 global pointer for workload buffer
+uint64_t *global_workload_buf;
+uint64_t workload_len;
+uint64_t conn_init_index;
+
+//junyaoy 1/17/2022 use to stop program after all connection exits
+uint32_t total_threads;
+uint32_t exited_num;
+pthread_mutex_t exit_lock;
+
+
 #ifdef USE_TLS
 SSL_CTX *global_ctx;
 #endif
@@ -85,6 +116,7 @@ enum conn_rand {
     conn_rand_off = 0,
     conn_rand_uniform,
     conn_rand_zipf,
+    conn_rand_workload //junyaoy 01/13/2022 explicit workload option 
 };
 
 typedef struct _mc_thread {
@@ -107,6 +139,7 @@ typedef struct _mc_tshared {
     unsigned char value[VALUE_MAX_SIZE];     /* manually specified seed value */
 } mc_tshared;
 
+//every connection use it's own connection struct
 struct connection {
     /* Owner thread */
     mc_thread *t;
@@ -147,12 +180,14 @@ struct connection {
     uint64_t *write_count;
     uint32_t key_count;
     unsigned char *wbuf_pos;
+    uint64_t workload_buf_index; //junyaoy 01/13/2022
 
     /* random number handling */
     pcg32_random_t rng; // every connection can have its own rng.
     enum conn_rand rand; // randomized options for run_counter().
     double zipf_skew;
     double zipf_t; // precalc against the skew
+    uint32_t murmur3_seed; //junyaoy 01/13/2022
 
     /* time pacing */
     struct timeval next_sleep;
@@ -283,6 +318,12 @@ static inline void run_counter(struct connection *c) {
             break;
         case conn_rand_zipf:
             *c->cur_key = zipf_sample(&c->rng, c->zipf_t, c->zipf_skew);
+            break;
+        case conn_rand_workload: //junyaoy 1/13/2022
+            *c->cur_key = global_workload_buf[c->workload_buf_index];
+            if (++c->workload_buf_index >= workload_len){
+                c->workload_buf_index = 0;
+            }
             break;
     }
 }
@@ -864,6 +905,11 @@ static int new_connection(struct connection *t, char *sock_path)
         c->zipf_t = zipf_calc_t(c->key_count, c->zipf_skew);
     }
 
+    if (c->rand == conn_rand_workload) {
+        c->workload_buf_index = conn_init_index;
+        conn_init_index = conn_init_index + INDEX_INIT_INTERVAL % workload_len;
+    }
+
     if (sock_path == NULL) {
         error = getaddrinfo(c->host, c->port_num, &hints, &ai);
         if (error != 0) {
@@ -1002,6 +1048,8 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
     int new_thread = 0;
     char key_prefix_tmp[270];
     char cmd_postfix_tmp[1024];
+    //junyaoy 01/13/2022 
+    char *workload_path_tmp;
 
     enum {
         SEND = 0,
@@ -1023,13 +1071,16 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
         VALUE,
         LIVE_RAND,
         LIVE_RAND_ZIPF,
+        REAL_WORKLOAD, //junyaoy 1/13/2022
         STOP_AFTER,
         KEY_COUNT,
         HOST,
         PORT,
         THREAD,
         PIPELINES,
-        ZIPF_SKEW
+        ZIPF_SKEW,
+        WORKLOAD_PATH, //junyaoy 1/13/2022
+        WORKLOAD_LENGTH //junyaoy 1/13/2022 if length is larger than workload, fit entire trace in to buffer.
     };
 
     char *const key_options[] = {
@@ -1052,6 +1103,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
         [VALUE]            = "value",
         [LIVE_RAND]        = "live_rand",
         [LIVE_RAND_ZIPF]   = "live_rand_zipf",
+        [REAL_WORKLOAD]    = "real_workload",
         [STOP_AFTER]       = "stop_after",
         [KEY_COUNT]        = "key_count",
         [HOST]             = "host",
@@ -1059,6 +1111,8 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
         [THREAD]           = "thread",
         [PIPELINES]        = "pipelines",
         [ZIPF_SKEW]        = "zipf_skew",
+        [WORKLOAD_PATH]    = "workload_path",
+        [WORKLOAD_LENGTH]  = "workload_length",
         NULL
     };
 
@@ -1149,6 +1203,10 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
         case LIVE_RAND_ZIPF:
             template.rand = conn_rand_zipf;
             break;
+        case REAL_WORKLOAD:
+            //junyaoy 01/13/2022
+            template.rand = conn_rand_workload;
+            break;
         case STOP_AFTER:
             template.stop_after = atoi(value);
             break;
@@ -1166,6 +1224,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
             break;
         case THREAD:
             new_thread = atoi(value);
+            total_threads += new_thread; //junyaoy 1/17/2022
             break;
         case PIPELINES:
             template.pipelines = atoi(value);
@@ -1173,9 +1232,70 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
         case ZIPF_SKEW:
             template.zipf_skew = strtod(value, NULL);
             break;
+        case WORKLOAD_PATH:
+            //junyaoy 01/13/2022
+            workload_path_tmp = strdup(value);
+            break;
+        case WORKLOAD_LENGTH:
+            //junyaoy 01/13/2022
+            workload_len = strtoull(value, NULL, 10);
+            break;
         }
     }
 
+    if (template.rand == conn_rand_workload) {
+        //default to 0, 
+        //randomize it in new_connection()
+        template.workload_buf_index = 0; 
+        
+        if (global_workload_buf == NULL && workload_len != 0) {
+            
+            global_workload_buf = malloc(workload_len*sizeof(uint64_t));
+            if (global_workload_buf == NULL) {
+                perror("global buffer allocation failed\n");
+                exit(-1);
+            }
+
+            //open new file, report error if failed
+            FILE* rfd;
+            if((rfd = fopen(workload_path_tmp,"r")) == NULL)
+            { perror("open error for read workload"); exit(-1); }
+            //process and feed all request to global buff
+            //if global buff is not null, skip it
+            //use the workload specify in the first config line as default workload
+            //for all workload.
+            printf("workload loading start...\n");
+            ssize_t read;
+            char* line = NULL;
+            size_t len = 0;
+            char* token;
+            char* raw_key;
+            unsigned long cnt = 0;
+            uint64_t murmur3_key[2];
+            read = getline(&line, &len, rfd);
+            while ( (cnt < workload_len) && 
+                   ((read = getline(&line, &len, rfd)) != -1)) {
+
+             
+                token = strtok(line, "\n");
+                raw_key = strdup(token); //dup the key
+                MurmurHash3_x64_128(raw_key,
+                                    strlen(raw_key),
+                                    205103, //deterministic seed
+                                    murmur3_key);
+                free(raw_key);
+                global_workload_buf[cnt] = murmur3_key[1];
+                cnt++;
+            }
+
+            workload_len = cnt;
+            printf("workload loading complete! ins:%llu\n",workload_len);
+            free(workload_path_tmp);
+            free((void*)line);
+            fclose(rfd);
+        }
+        
+    }
    
     if (strcmp(sender, "ascii_getset") == 0) {
         template.writer = ascii_write_flat_to_client_noupdate;
@@ -1292,6 +1412,14 @@ static void *thread_runner(void *arg) {
     mc_thread *t = arg;
     int ret = event_base_loop(t->base, 0);
     fprintf(stderr, "Thread exiting: %d\n", ret);
+    //exit when all connection are done,
+    pthread_mutex_lock(&exit_lock);
+    exited_num += 1;
+    if(exited_num == total_threads+1) {
+        fprintf(stderr, "all %lu threads exited.\n", total_threads);
+        exit(-1);
+    }
+    pthread_mutex_unlock(&exit_lock);
     return NULL;
 }
 
@@ -1333,7 +1461,21 @@ int main(int argc, char **argv)
     setvbuf(stdout, NULL, _IONBF, 0);
     mc_thread *main_thread = NULL;
     main_thread = calloc(1, sizeof(mc_thread));
-    setup_thread(main_thread);
+    setup_thread(main_thread); 
+
+    global_workload_buf = NULL; //junyaoy 01/13/2022
+    workload_len = 0;
+    conn_init_index = 0;
+
+    
+    //junyaoy 1/17/2022
+    total_threads = 0;
+    exited_num = 0;
+    if (pthread_mutex_init(&exit_lock, NULL) != 0) {
+        printf("\n mutex init has failed\n");
+        return 1;
+    }
+
 #ifdef USE_TLS
     ssl_init();
 #endif

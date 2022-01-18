@@ -1,2 +1,1 @@
-send=ascii_get,recv=blind_read,conns=20,thread=40,key_prefix=slab:,key_prealloc=0,key_count=60000,live_rand_zipf=1,zipf_skew=0.5
-send=ascii_set,recv=blind_read,conns=20,thread=4,key_prefix=slab:,value_size=1000,key_count=60000,key_prealloc=0
+send=ascii_getset,recv=blind_read,thread=20,conns=70,key_prefix=slab1:,key_prealloc=0,key_count=6000000,value_size=1000,live_rand_zipf=1,zipf_skew=0.5

@@ -1,0 +1,1 @@
+send=ascii_getset,recv=blind_read,thread=1,conns=1,key_prefix=slab1:,key_prealloc=0,key_count=6000000,value_size=1000,real_workload=1,workload_path=/home/junyaoy/MSR-offline-traces/src1.csv,workload_length=85069608,stop_after=85069608
