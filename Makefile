@@ -1,7 +1,7 @@
 PREFIX=/usr/local
 
 all:
-	gcc -g -O2 -pthread -o mc-crusher mc-crusher.c pcg-basic.c itoa_ljust.c murmur3.c $(LDFLAGS) -levent -lm
+	gcc -g -O2 -D_GNU_SOURCE -pthread -o mc-crusher mc-crusher.c pcg-basic.c itoa_ljust.c murmur3.c twitter_2020.c $(LDFLAGS) -levent -lm
 	gcc -g -O2 -o balloon balloon.c $(LDFLAGS)
 
 static:

@@ -64,6 +64,9 @@
 #include "pcg-basic.h"
 #include "itoa_ljust.h"
 #include "murmur3.h" //junyaoy 01/13/2022
+#include "twitter_2020.h"
+#include <sched.h>
+
 
 #define SHARED_RBUF_SIZE 1024 * 64
 #define SHARED_VALUE_SIZE 1024 * 1024
@@ -76,6 +79,10 @@
 #define MISS 1
 //junyaoy 01/13/2022
 #define INDEX_INIT_INTERVAL 40000
+
+//junyaoy 01/20/2022
+#define SIM_TYPE 1 //simple preprocessed traces
+#define TW_TYPE 2 //twitter trace see twitter_2020.c for format
 
 // avoiding some hacks for finding member size.
 #define SOCK_MAX 100
@@ -90,7 +97,9 @@ int alarm_fired = 0;
 //junyaoy 01/13/2022 global pointer for workload buffer
 uint64_t *global_workload_buf;
 uint64_t workload_len;
+uint8_t workload_type; //1/22/2022
 uint64_t conn_init_index;
+
 
 //junyaoy 1/17/2022 use to stop program after all connection exits
 uint32_t total_threads;
@@ -121,6 +130,7 @@ enum conn_rand {
 
 typedef struct _mc_thread {
     pthread_t thread_id;
+    uint32_t cpu_num; //junyaoy optional 
     struct event_base *base;
     unsigned char *shared_value;
     unsigned char *shared_rbuf;
@@ -1046,6 +1056,8 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
     char *reader = NULL;
     int add_space = 0;
     int new_thread = 0;
+    uint32_t* cpu_afin_arr; // junyaoy 01/30/2022
+    char *cpu_afin_path = NULL;
     char key_prefix_tmp[270];
     char cmd_postfix_tmp[1024];
     //junyaoy 01/13/2022 
@@ -1080,7 +1092,9 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
         PIPELINES,
         ZIPF_SKEW,
         WORKLOAD_PATH, //junyaoy 1/13/2022
-        WORKLOAD_LENGTH //junyaoy 1/13/2022 if length is larger than workload, fit entire trace in to buffer.
+        WORKLOAD_LENGTH, //junyaoy 1/13/2022 if length is larger than workload, fit entire trace in to buffer.
+        WORKLOAD_TYPE, //junyaoy 1/13/2022 handle separate trace type, mostly for later potential complex trace treament
+        CPU_AFIN_PATH //junyaoy /1/30/2022
     };
 
     char *const key_options[] = {
@@ -1103,7 +1117,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
         [VALUE]            = "value",
         [LIVE_RAND]        = "live_rand",
         [LIVE_RAND_ZIPF]   = "live_rand_zipf",
-        [REAL_WORKLOAD]    = "real_workload",
+        [REAL_WORKLOAD]    = "real_workload", //junyaoy
         [STOP_AFTER]       = "stop_after",
         [KEY_COUNT]        = "key_count",
         [HOST]             = "host",
@@ -1111,8 +1125,10 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
         [THREAD]           = "thread",
         [PIPELINES]        = "pipelines",
         [ZIPF_SKEW]        = "zipf_skew",
-        [WORKLOAD_PATH]    = "workload_path",
+        [WORKLOAD_PATH]    = "workload_path", //Junyaoy 1/13/2022
         [WORKLOAD_LENGTH]  = "workload_length",
+        [WORKLOAD_TYPE]    = "workload_type", //junyaoy see MACROs above
+        [CPU_AFIN_PATH]    = "cpu_afin_path",
         NULL
     };
 
@@ -1140,7 +1156,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
     template.s->value[0] = '\0';
     
     template.read_info = HIT;
-
+    
     /* Chomp the ending newline */
     tmp = rindex(line, '\n');
     if (tmp != NULL) 
@@ -1240,6 +1256,16 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
             //junyaoy 01/13/2022
             workload_len = strtoull(value, NULL, 10);
             break;
+        case WORKLOAD_TYPE:
+            //junyaoy 01/20/2022
+            if (strcmp(value, "twitter") == 0) {
+                workload_type = TW_TYPE;
+            }
+            break;
+        case CPU_AFIN_PATH:
+            //junyaoy 01/30/2022
+            cpu_afin_path = strdup(value);
+            
         }
     }
 
@@ -1256,43 +1282,57 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
                 exit(-1);
             }
 
-            //open new file, report error if failed
-            FILE* rfd;
-            if((rfd = fopen(workload_path_tmp,"r")) == NULL)
-            { perror("open error for read workload"); exit(-1); }
+           
             //process and feed all request to global buff
             //if global buff is not null, skip it
             //use the workload specify in the first config line as default workload
             //for all workload.
             printf("workload loading start...\n");
-            ssize_t read;
-            char* line = NULL;
-            size_t len = 0;
-            char* token;
-            char* raw_key;
-            unsigned long cnt = 0;
-            uint64_t murmur3_key[2];
-            read = getline(&line, &len, rfd);
-            while ( (cnt < workload_len) && 
-                   ((read = getline(&line, &len, rfd)) != -1)) {
+            
+            if (workload_type == TW_TYPE) {
+                tw_iterator_t* itr = tw_trace_init(workload_path_tmp, 10000, CONTINUE);
+                tw_ref_t* ref = NULL;
+                unsigned long cnt = 0;
+                while((cnt < workload_len) &&
+                      !tw_trace_finished(itr)) {
+                    ref = tw_trace_next(itr);
+                    global_workload_buf[cnt] = ref->murmur3_hashed_key[1];
+                    cnt++;
+                }
+            }else {
+                 //open new file, report error if failed
+                FILE* rfd;
+                if((rfd = fopen(workload_path_tmp,"r")) == NULL)
+                { perror("open error for read workload"); exit(-1); }
+                ssize_t read;
+                char* line = NULL;
+                size_t len = 0;
+                char* token;
+                char* raw_key;
+                unsigned long cnt = 0;
+                uint64_t murmur3_key[2];
+                read = getline(&line, &len, rfd);
+                while ( (cnt < workload_len) && 
+                    ((read = getline(&line, &len, rfd)) != -1)) {
 
-             
-                token = strtok(line, "\n");
-                raw_key = strdup(token); //dup the key
-                MurmurHash3_x64_128(raw_key,
-                                    strlen(raw_key),
-                                    205103, //deterministic seed
-                                    murmur3_key);
-                free(raw_key);
-                global_workload_buf[cnt] = murmur3_key[1];
-                cnt++;
+                
+                    token = strtok(line, "\n");
+                    raw_key = strdup(token); //dup the key
+                    MurmurHash3_x64_128(raw_key,
+                                        strlen(raw_key),
+                                        205103, //deterministic seed
+                                        murmur3_key);
+                    free(raw_key);
+                    global_workload_buf[cnt] = murmur3_key[1];
+                    cnt++;
+                }
+
+                workload_len = cnt;
+                printf("workload loading complete! ins:%llu\n",workload_len);
+                free(workload_path_tmp);
+                free((void*)line);
+                fclose(rfd);
             }
-
-            workload_len = cnt;
-            printf("workload loading complete! ins:%llu\n",workload_len);
-            free(workload_path_tmp);
-            free((void*)line);
-            fclose(rfd);
         }
         
     }
@@ -1370,12 +1410,46 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
     template.s->cmd_postfix_len = strlen(template.s->cmd_postfix);
 
     if (new_thread != 0) {
+
+        //junyaoy 01/30/2022
+        //get cpu assignment
+        //
+
+        cpu_afin_arr = malloc(new_thread*sizeof(uint32_t));
+
+        FILE* cpu_rfd;
+        if((cpu_rfd = fopen(cpu_afin_path,"r")) == NULL)
+        { perror("open error for read workload"); exit(-1); }
+        ssize_t read;
+        char* line = NULL;
+        size_t len = 0;
+        char* token;
+        char* raw_key;
+        unsigned long cnt = 0;
+        while ((cnt < new_thread) &&
+               ((read = getline(&line, &len, cpu_rfd)) != -1)) {
+
+        
+            token = strtok(line, "\n");
+            raw_key = strdup(token); //dup the key
+            cpu_afin_arr[cnt] = strtoul(raw_key,NULL, 10);
+            free(raw_key);
+            cnt++;
+        }
+
+
+        free(cpu_afin_path);
+        free((void*)line);
+        fclose(cpu_rfd);
+        //
+
         // spawn N threads with very similar configurations. allows sharing
         // the key blob memory.
         for (x = 0; x < new_thread; x++) {
             template.t = calloc(1, sizeof(mc_thread));
             setup_thread(template.t);
             start_template(&template, conns_tomake, use_sock);
+            template.t->cpu_num = cpu_afin_arr[x];
             create_thread(template.t);
         }
     } else {
@@ -1429,7 +1503,7 @@ static void setup_thread(mc_thread *t) {
         fprintf(stderr, "Cannot allocate event base\n");
         exit(1);
     }
-
+    t->cpu_num = -1; //junyaoy
     t->shared_value = calloc(SHARED_VALUE_SIZE, sizeof(unsigned char));
     t->shared_rbuf = calloc(SHARED_RBUF_SIZE, sizeof(unsigned char));
 }
@@ -1439,6 +1513,29 @@ static void create_thread(mc_thread *t) {
     int ret;
 
     pthread_attr_init(&attr);
+    if (t->cpu_num != -1) {
+        //get a number
+    
+        cpu_set_t m;
+ 
+
+        CPU_ZERO(&m);
+        sched_getaffinity(0, sizeof(cpu_set_t), &m);
+
+       
+        if (CPU_ISSET(t->cpu_num, &m)) {
+            CPU_ZERO(&m);
+            CPU_SET(t->cpu_num, &m);
+            if ((ret = pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &m)) != 0) {
+                fprintf(stderr, "Can't set thread affinity: %s\n",
+                        strerror(ret));
+                exit(1);
+            }
+        }
+        
+    }
+    
+    
     if ((ret = pthread_create(&t->thread_id, &attr, thread_runner, t)) != 0) {
         fprintf(stderr, "Cannot create thread: %s\n", strerror(ret));
         exit(1);
@@ -1465,7 +1562,9 @@ int main(int argc, char **argv)
 
     global_workload_buf = NULL; //junyaoy 01/13/2022
     workload_len = 0;
+    workload_type = SIM_TYPE; //default to preprocessed workload type
     conn_init_index = 0;
+
 
     
     //junyaoy 1/17/2022

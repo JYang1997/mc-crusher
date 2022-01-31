@@ -1,2 +1,3 @@
 #!/bin/bash
 ./bench-sample 192.168.2.2:11311 15 10 cmd_get get_hits cmd_set
+# ./bench-sample 141.219.186.174:11311 15 10 cmd_get get_hits cmd_set
