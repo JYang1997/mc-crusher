@@ -1056,7 +1056,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
     char *reader = NULL;
     int add_space = 0;
     int new_thread = 0;
-    uint32_t* cpu_afin_arr; // junyaoy 01/30/2022
+    uint32_t* cpu_afin_arr = NULL; // junyaoy 01/30/2022
     char *cpu_afin_path = NULL;
     char key_prefix_tmp[270];
     char cmd_postfix_tmp[1024];
@@ -1414,42 +1414,46 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
         //junyaoy 01/30/2022
         //get cpu assignment
         //
-
-        cpu_afin_arr = malloc(new_thread*sizeof(uint32_t));
-
-        FILE* cpu_rfd;
-        if((cpu_rfd = fopen(cpu_afin_path,"r")) == NULL)
-        { perror("open error for read workload"); exit(-1); }
-        ssize_t read;
-        char* line = NULL;
-        size_t len = 0;
-        char* token;
-        char* raw_key;
-        unsigned long cnt = 0;
-        while ((cnt < new_thread) &&
-               ((read = getline(&line, &len, cpu_rfd)) != -1)) {
+        if(cpu_afin_path != NULL) {
 
         
-            token = strtok(line, "\n");
-            raw_key = strdup(token); //dup the key
-            cpu_afin_arr[cnt] = strtoul(raw_key,NULL, 10);
-            free(raw_key);
-            cnt++;
-        }
+            cpu_afin_arr = malloc(new_thread*sizeof(uint32_t));
+
+            FILE* cpu_rfd;
+            if((cpu_rfd = fopen(cpu_afin_path,"r")) == NULL)
+            { perror("open error for read workload"); exit(-1); }
+            ssize_t read;
+            char* line = NULL;
+            size_t len = 0;
+            char* token;
+            char* raw_key;
+            unsigned long cnt = 0;
+            while ((cnt < new_thread) &&
+                ((read = getline(&line, &len, cpu_rfd)) != -1)) {
+
+            
+                token = strtok(line, "\n");
+                raw_key = strdup(token); //dup the key
+                cpu_afin_arr[cnt] = strtoul(raw_key,NULL, 10);
+                free(raw_key);
+                cnt++;
+            }
 
 
-        free(cpu_afin_path);
-        free((void*)line);
-        fclose(cpu_rfd);
+            free(cpu_afin_path);
+            free((void*)line);
+            fclose(cpu_rfd);
         //
-
+        }
         // spawn N threads with very similar configurations. allows sharing
         // the key blob memory.
         for (x = 0; x < new_thread; x++) {
             template.t = calloc(1, sizeof(mc_thread));
             setup_thread(template.t);
             start_template(&template, conns_tomake, use_sock);
-            template.t->cpu_num = cpu_afin_arr[x];
+            if(cpu_afin_arr != NULL){
+                template.t->cpu_num = cpu_afin_arr[x];
+            }
             create_thread(template.t);
         }
     } else {
