@@ -147,3 +147,29 @@ A short list of things I intend to change or add:
 - Add commands to iterate over different value sizes
 
 - Bundle a better perl util for printing stats
+
+
+few more add on functions:
+---------------------------
+
+really rough, but works
+
+thread affinity:
+
+- use'cpu_afin_path=[path to new line separated cpu assignment]'
+
+external-trace replay:
+- load workload to a buffer, and continously replay the buffer
+- 'real_workload=[path to workload with new line separated addresses]'
+- 'workload_length=[workload length]' this is the buffer size, if it is less than workload length than only first 'workload_length' references are loaded.
+- 'stop_after' to stop the replay after certain number of references
+
+get with setback:
+- 'send=ascii_getset'
+- this will set the key to memcached if server returns a miss
+
+dump latency:
+- 'latency_dump_path=[dump to this file, append to the file]'
+- 'latency_dump_len=[number of continuous latency measure from each connection]'
+- before collecting latency, there is a 1000 warm up requests from each connection.
+- use stop_after to stop each connection, each connection start dummping latencies when stop_after reached.

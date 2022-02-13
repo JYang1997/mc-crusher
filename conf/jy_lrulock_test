@@ -1,2 +1,1 @@
-send=ascii_set,recv=blind_read,thread=12,cpu_afin_path=/home/junyaoy/MEMCACHED/mc-crusher/cpu_afin_client.txt,conns=70,key_prefix=slab1:,key_prealloc=0,key_count=6000000,value_size=1000,live_rand_zipf=1,zipf_skew=0.5
-send=ascii_set,recv=blind_read,thread=12,cpu_afin_path=/home/junyaoy/MEMCACHED/mc-crusher/cpu_afin_client2.txt,conns=70,key_prefix=slab2:,key_prealloc=0,key_count=6000000,value_size=100,live_rand_zipf=1,zipf_skew=0.5
+send=ascii_set,recv=blind_read,thread=24,cpu_afin_path=/home/junyaoy/MEMCACHED/mc-crusher/cpu_afin_client.txt,conns=70,key_prefix=slab1:,key_prealloc=0,key_count=6000000,value_size=1000,live_rand_zipf=1,zipf_skew=0.5,latency_dump_path=./test_dump.txt,latency_dump_len=10,stop_after=10000

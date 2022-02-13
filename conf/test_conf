@@ -1,1 +1,1 @@
-send=ascii_set,recv=blind_read,thread=24,cpu_afin_path=/home/junyaoy/MEMCACHED/mc-crusher/cpu_afin_client.txt,conns=70,key_prefix=slab1:,key_prealloc=0,key_count=6000000,value_size=1000,live_rand_zipf=1,zipf_skew=0.5
+send=ascii_set,recv=blind_read,thread=24,cpu_afin_path=/home/junyaoy/MEMCACHED/mc-crusher/cpu_afin_client.txt,conns=70,key_prefix=slab1:,key_prealloc=0,key_count=6000000,value_size=1,live_rand_zipf=1,zipf_skew=0.5

@@ -84,6 +84,8 @@
 #define SIM_TYPE 1 //simple preprocessed traces
 #define TW_TYPE 2 //twitter trace see twitter_2020.c for format
 
+//junyaoy 2/12/2022
+#define LAT_WARM_CNT 1000
 // avoiding some hacks for finding member size.
 #define SOCK_MAX 100
 
@@ -106,6 +108,8 @@ uint32_t total_threads;
 uint32_t exited_num;
 pthread_mutex_t exit_lock;
 
+//junyaoy 2/12/2022 use to protect append to latency file
+pthread_mutex_t lat_append_lock;
 
 #ifdef USE_TLS
 SSL_CTX *global_ctx;
@@ -213,6 +217,12 @@ struct connection {
     int (*ascii_format)(struct connection *c);
     int (*bin_format)(struct connection *c);
     int (*bin_prep_cmd)(struct connection *c);
+    
+    struct timeval st; //jy
+    int latency_dump_len;
+    FILE* latency_dump_fd; //2/10/2022
+    int latency_curr_index;
+    uint32_t *resp_times; //junyaoy 2/10/2022 dump certain number of response time
     //junyaoy 12/016/2021  per connection buffer, used for setback
     unsigned char rbuf[RBUF_SIZE]; //check server return content to identify miss
     unsigned char wbuf[WBUF_SIZE]; // putting this at the end to get more of the above into fewer cachelines.
@@ -303,6 +313,9 @@ static void write_flat(struct connection *c, enum conn_states next_state) {
         c->wbuf_written += written;
         c->state = conn_sending;
     } else {
+        //jy write done, start timer 02/12/2022 
+        gettimeofday(&(c->st), NULL); 
+        //
         c->state = next_state;
         if (c->state == conn_reading) {
             update_conn_event(c, EV_READ | EV_PERSIST);
@@ -631,13 +644,24 @@ static void read_from_client(void *arg) {
         rbytes = SSL_read(c->ssl, c->rbuf, RBUF_SIZE);
 #else
         rbytes = read(c->fd, c->rbuf, RBUF_SIZE);
-#endif
+#endif  
+
         if (rbytes == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 exit(-1);
                 break;
             } else {
                 perror("Read error from client");
+            }
+        }else if(rbytes > 0){
+            //server response get
+            //02/12/2022 store duration
+            struct timeval et;
+            gettimeofday(&et, NULL);
+            if (*(c->write_count) > LAT_WARM_CNT && c->latency_curr_index < c->latency_dump_len) { 
+                //warmup time
+                c->resp_times[c->latency_curr_index]= ((et.tv_sec - (c->st).tv_sec) * 1000000) + (et.tv_usec - (c->st).tv_usec);
+                c->latency_curr_index++;
             }
         }
        
@@ -743,12 +767,22 @@ static void setback_read_from_client(void *arg) {
             } else {
                 perror("Read error from client");
             }
-        }else{
+        }else if (rbytes > 0){
     //        printf("rbuf:%.100s, size:%d\n",c->rbuf,rbytes);
             if (strncmp(c->rbuf, "END",3) == 0) {
                 memset(c->rbuf,0,(size_t)RBUF_SIZE);
                 c->read_info = MISS;
+                //this is miss donot store latency
+                //wait for set done
                 return;         
+            } else {
+                //02/12/2022 jy store latency if hit
+                struct timeval et;
+                gettimeofday(&et, NULL);
+                if (*(c->write_count) > LAT_WARM_CNT && c->latency_curr_index < c->latency_dump_len) { 
+                    c->resp_times[c->latency_curr_index]= ((et.tv_sec - (c->st).tv_sec) * 1000000) + (et.tv_usec - (c->st).tv_usec);
+                    c->latency_curr_index++;
+                }
             }
             memset(c->rbuf,0,(size_t)RBUF_SIZE);
             break;
@@ -795,6 +829,13 @@ static inline void run_write(struct connection *c) {
         write_flat(c, c->next_state);
     }
     if (c->stop_after && *c->write_count >= c->stop_after) {
+        //dump out latency to the specified file
+        //protect it, just to makesure append to file works properly
+        pthread_mutex_lock(&lat_append_lock);
+        for (int i = 0; i<c->latency_curr_index; i++) {
+            fprintf(c->latency_dump_fd, "%d\n", c->resp_times[i]);
+        }
+        pthread_mutex_unlock(&lat_append_lock);
         event_del(&c->ev);
     }
 }
@@ -904,6 +945,11 @@ static int new_connection(struct connection *t, char *sock_path)
     int error;
     struct connection *c = (struct connection *)malloc(sizeof(struct connection));
     memcpy(c, t, sizeof(struct connection));
+
+    //junyaoy 02/20/2022 if latency fd != null, allocate a buffer for it
+    if (c->latency_dump_fd != NULL && c->latency_dump_len != 0) {
+        c->resp_times = malloc(sizeof(uint32_t)*c->latency_dump_len);
+    } 
 
     // no reason to avoid initializing an rng. this gives us a sequence unique
     // to the memory address of this particular connection.
@@ -1062,6 +1108,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
     char cmd_postfix_tmp[1024];
     //junyaoy 01/13/2022 
     char *workload_path_tmp;
+    char *latency_dump_path_tmp = NULL;
 
     enum {
         SEND = 0,
@@ -1094,7 +1141,9 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
         WORKLOAD_PATH, //junyaoy 1/13/2022
         WORKLOAD_LENGTH, //junyaoy 1/13/2022 if length is larger than workload, fit entire trace in to buffer.
         WORKLOAD_TYPE, //junyaoy 1/13/2022 handle separate trace type, mostly for later potential complex trace treament
-        CPU_AFIN_PATH //junyaoy /1/30/2022
+        CPU_AFIN_PATH, //junyaoy /1/30/2022
+        LATENCY_DUMP_PATH, //junyaoy 2/10/2022
+        LATENCY_DUMP_LEN //junyaoy 2/10/2022 dump len per connection
     };
 
     char *const key_options[] = {
@@ -1129,6 +1178,8 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
         [WORKLOAD_LENGTH]  = "workload_length",
         [WORKLOAD_TYPE]    = "workload_type", //junyaoy see MACROs above
         [CPU_AFIN_PATH]    = "cpu_afin_path",
+        [LATENCY_DUMP_PATH] = "latency_dump_path", //junyaoy 2/10/2022
+        [LATENCY_DUMP_LEN] =  "latency_dump_len", //junyaoy 2/10/2022 dump len per connection
         NULL
     };
 
@@ -1156,7 +1207,11 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
     template.s->value[0] = '\0';
     
     template.read_info = HIT;
-    
+    template.resp_times = NULL; //default null
+    template.latency_dump_fd = NULL;
+    template.latency_dump_len = 0;
+
+
     /* Chomp the ending newline */
     tmp = rindex(line, '\n');
     if (tmp != NULL) 
@@ -1265,10 +1320,25 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
         case CPU_AFIN_PATH:
             //junyaoy 01/30/2022
             cpu_afin_path = strdup(value);
-            
+            break;
+        case LATENCY_DUMP_LEN:
+            template.latency_dump_len = atoi(value);
+            template.latency_curr_index = 0;
+            break;
+        case LATENCY_DUMP_PATH:
+            latency_dump_path_tmp = strdup(value);
         }
     }
-
+    //collect latency to a file 02/10/2022 jy
+    if (latency_dump_path_tmp != NULL) {
+        if (template.latency_dump_len <= 0) {
+            perror("latency len error\n");
+            exit(-1);
+        }
+        if((template.latency_dump_fd = fopen(latency_dump_path_tmp,"a")) == NULL)
+        { perror("open error for latency dump\n"); exit(-1); }
+        
+    }
     if (template.rand == conn_rand_workload) {
         //default to 0, 
         //randomize it in new_connection()
@@ -1578,7 +1648,10 @@ int main(int argc, char **argv)
         printf("\n mutex init has failed\n");
         return 1;
     }
-
+    if (pthread_mutex_init(&lat_append_lock, NULL) != 0) {
+        printf("\n mutex init has failed\n");
+        return 1;
+    }
 #ifdef USE_TLS
     ssl_init();
 #endif
