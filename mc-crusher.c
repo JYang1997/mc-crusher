@@ -97,10 +97,12 @@ char sock_path_default[SOCK_MAX];
 int alarm_fired = 0;
 
 //junyaoy 01/13/2022 global pointer for workload buffer
-uint64_t *global_workload_buf;
-uint64_t workload_len;
-uint8_t workload_type; //1/22/2022
-uint64_t conn_init_index;
+// 2/20/2022 max of 10 separate workload
+#define MAX_TRACE 10
+uint64_t *global_workload_buf[MAX_TRACE];
+uint64_t workload_len[MAX_TRACE];
+uint8_t workload_type[MAX_TRACE]; //1/22/2022
+uint64_t conn_init_index[MAX_TRACE];
 
 
 //junyaoy 1/17/2022 use to stop program after all connection exits
@@ -173,6 +175,9 @@ struct connection {
 #ifdef USE_TLS
     SSL *ssl;
 #endif
+    //jy 2/14/2022
+    uint32_t conn_id;
+    short zipf_unique_conn;
 
     /* Counters, bits, flags for individual senders/getters. */
     int mget_count;                /* # of ascii mget keys to send at once */
@@ -195,7 +200,7 @@ struct connection {
     uint32_t key_count;
     unsigned char *wbuf_pos;
     uint64_t workload_buf_index; //junyaoy 01/13/2022
-
+    uint32_t workload_index;
     /* random number handling */
     pcg32_random_t rng; // every connection can have its own rng.
     enum conn_rand rand; // randomized options for run_counter().
@@ -341,10 +346,13 @@ static inline void run_counter(struct connection *c) {
             break;
         case conn_rand_zipf:
             *c->cur_key = zipf_sample(&c->rng, c->zipf_t, c->zipf_skew);
+            if (c->zipf_unique_conn == 1) { //jy 2/14/2022 make key unique to each conn
+                *c->cur_key = c->t->thread_id << 42 | (uint64_t)c->conn_id << 33 | *c->cur_key;
+            }
             break;
         case conn_rand_workload: //junyaoy 1/13/2022
-            *c->cur_key = global_workload_buf[c->workload_buf_index];
-            if (++c->workload_buf_index >= workload_len){
+            *c->cur_key = global_workload_buf[c->workload_index][c->workload_buf_index];
+            if (++c->workload_buf_index >= workload_len[c->workload_index]){
                 c->workload_buf_index = 0;
             }
             break;
@@ -945,7 +953,7 @@ static int new_connection(struct connection *t, char *sock_path)
     int error;
     struct connection *c = (struct connection *)malloc(sizeof(struct connection));
     memcpy(c, t, sizeof(struct connection));
-
+    
     //junyaoy 02/20/2022 if latency fd != null, allocate a buffer for it
     if (c->latency_dump_fd != NULL && c->latency_dump_len != 0) {
         c->resp_times = malloc(sizeof(uint32_t)*c->latency_dump_len);
@@ -962,8 +970,8 @@ static int new_connection(struct connection *t, char *sock_path)
     }
 
     if (c->rand == conn_rand_workload) {
-        c->workload_buf_index = conn_init_index;
-        conn_init_index = conn_init_index + INDEX_INIT_INTERVAL % workload_len;
+        c->workload_buf_index = conn_init_index[c->workload_index];
+        conn_init_index[c->workload_index] = conn_init_index[c->workload_index] + INDEX_INIT_INTERVAL % workload_len[c->workload_index];
     }
 
     if (sock_path == NULL) {
@@ -1108,8 +1116,15 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
     char cmd_postfix_tmp[1024];
     //junyaoy 01/13/2022 
     char *workload_path_tmp;
+    int workload_num = -1;
     char *latency_dump_path_tmp = NULL;
 
+    for (int i = 0; i < MAX_TRACE; i++) {
+        if (global_workload_buf[i] == NULL) {
+            workload_num = i;
+            break;
+        }
+    }
     enum {
         SEND = 0,
         RECV,
@@ -1143,7 +1158,8 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
         WORKLOAD_TYPE, //junyaoy 1/13/2022 handle separate trace type, mostly for later potential complex trace treament
         CPU_AFIN_PATH, //junyaoy /1/30/2022
         LATENCY_DUMP_PATH, //junyaoy 2/10/2022
-        LATENCY_DUMP_LEN //junyaoy 2/10/2022 dump len per connection
+        LATENCY_DUMP_LEN, //junyaoy 2/10/2022 dump len per connection
+        ZIPF_UNIQUE_CONN 
     };
 
     char *const key_options[] = {
@@ -1180,6 +1196,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
         [CPU_AFIN_PATH]    = "cpu_afin_path",
         [LATENCY_DUMP_PATH] = "latency_dump_path", //junyaoy 2/10/2022
         [LATENCY_DUMP_LEN] =  "latency_dump_len", //junyaoy 2/10/2022 dump len per connection
+        [ZIPF_UNIQUE_CONN] = "zipf_unique_conn",
         NULL
     };
 
@@ -1210,7 +1227,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
     template.resp_times = NULL; //default null
     template.latency_dump_fd = NULL;
     template.latency_dump_len = 0;
-
+    template.zipf_unique_conn = 0;
 
     /* Chomp the ending newline */
     tmp = rindex(line, '\n');
@@ -1277,6 +1294,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
         case REAL_WORKLOAD:
             //junyaoy 01/13/2022
             template.rand = conn_rand_workload;
+            template.workload_index = workload_num;
             break;
         case STOP_AFTER:
             template.stop_after = atoi(value);
@@ -1309,12 +1327,12 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
             break;
         case WORKLOAD_LENGTH:
             //junyaoy 01/13/2022
-            workload_len = strtoull(value, NULL, 10);
+            workload_len[workload_num] = strtoull(value, NULL, 10);
             break;
         case WORKLOAD_TYPE:
             //junyaoy 01/20/2022
             if (strcmp(value, "twitter") == 0) {
-                workload_type = TW_TYPE;
+                workload_type[workload_num] = TW_TYPE;
             }
             break;
         case CPU_AFIN_PATH:
@@ -1327,6 +1345,9 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
             break;
         case LATENCY_DUMP_PATH:
             latency_dump_path_tmp = strdup(value);
+            break;
+        case ZIPF_UNIQUE_CONN:
+            template.zipf_unique_conn = 1;
         }
     }
     //collect latency to a file 02/10/2022 jy
@@ -1344,10 +1365,10 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
         //randomize it in new_connection()
         template.workload_buf_index = 0; 
         
-        if (global_workload_buf == NULL && workload_len != 0) {
+        if (global_workload_buf[workload_num] == NULL && workload_len[workload_num] != 0) {
             
-            global_workload_buf = malloc(workload_len*sizeof(uint64_t));
-            if (global_workload_buf == NULL) {
+            global_workload_buf[workload_num] = malloc(workload_len[workload_num]*sizeof(uint64_t));
+            if (global_workload_buf[workload_num] == NULL) {
                 perror("global buffer allocation failed\n");
                 exit(-1);
             }
@@ -1359,14 +1380,14 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
             //for all workload.
             printf("workload loading start...\n");
             
-            if (workload_type == TW_TYPE) {
+            if (workload_type[workload_num] == TW_TYPE) {
                 tw_iterator_t* itr = tw_trace_init(workload_path_tmp, 10000, CONTINUE);
                 tw_ref_t* ref = NULL;
                 unsigned long cnt = 0;
-                while((cnt < workload_len) &&
+                while((cnt < workload_len[workload_num]) &&
                       !tw_trace_finished(itr)) {
                     ref = tw_trace_next(itr);
-                    global_workload_buf[cnt] = ref->murmur3_hashed_key[1];
+                    global_workload_buf[workload_num][cnt] = ref->murmur3_hashed_key[1];
                     cnt++;
                 }
             }else {
@@ -1382,7 +1403,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
                 unsigned long cnt = 0;
                 uint64_t murmur3_key[2];
                 read = getline(&line, &len, rfd);
-                while ( (cnt < workload_len) && 
+                while ( (cnt < workload_len[workload_num]) && 
                     ((read = getline(&line, &len, rfd)) != -1)) {
 
                 
@@ -1393,12 +1414,12 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
                                         205103, //deterministic seed
                                         murmur3_key);
                     free(raw_key);
-                    global_workload_buf[cnt] = murmur3_key[1];
+                    global_workload_buf[workload_num][cnt] = murmur3_key[1];
                     cnt++;
                 }
 
-                workload_len = cnt;
-                printf("workload loading complete! ins:%llu\n",workload_len);
+                workload_len[workload_num] = cnt;
+                printf("workload loading complete! ins:%llu\n",workload_len[workload_num]);
                 free(workload_path_tmp);
                 free((void*)line);
                 fclose(rfd);
@@ -1540,6 +1561,7 @@ static void start_template(struct connection *template, int conns_tomake, bool u
 
     int i, newsock;
     for (i = 0; i < conns_tomake; i++) {
+        template->conn_id = i; //2/14/2022 create id for connection
         if (use_sock) {
             newsock = new_connection(template, (char *)&sock_path_default);
         } else {
@@ -1633,11 +1655,14 @@ int main(int argc, char **argv)
     mc_thread *main_thread = NULL;
     main_thread = calloc(1, sizeof(mc_thread));
     setup_thread(main_thread); 
-
-    global_workload_buf = NULL; //junyaoy 01/13/2022
-    workload_len = 0;
-    workload_type = SIM_TYPE; //default to preprocessed workload type
-    conn_init_index = 0;
+    
+    for (int i = 0; i < MAX_TRACE; i++) {
+        global_workload_buf[i] = NULL; //junyaoy 01/13/2022
+        workload_len[i] = 0;
+        workload_type[i] = SIM_TYPE; //default to preprocessed workload type
+        conn_init_index[i] = 0;
+    }
+    
 
 
     
