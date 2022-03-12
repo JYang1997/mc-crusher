@@ -115,8 +115,9 @@ void tw_trace_cleanUp(tw_iterator_t* itr) {
 		free((void*)(itr->trace_buf[i].op));
 	}
 	free((void*)(itr->trace_buf));
-	free((void*)itr);
+	
 	if(itr->flag == CONTINUE) fclose(itr->rfd);
+	free((void*)itr);
 }
 
 

@@ -83,9 +83,9 @@
 //junyaoy 01/20/2022
 #define SIM_TYPE 1 //simple preprocessed traces
 #define TW_TYPE 2 //twitter trace see twitter_2020.c for format
-
+#define IBM_TYPE 4
 //junyaoy 2/12/2022
-#define LAT_WARM_CNT 1000
+#define LAT_WARM_CNT 100000
 // avoiding some hacks for finding member size.
 #define SOCK_MAX 100
 
@@ -98,8 +98,11 @@ int alarm_fired = 0;
 
 //junyaoy 01/13/2022 global pointer for workload buffer
 // 2/20/2022 max of 10 separate workload
-#define MAX_TRACE 10
+#define MAX_TRACE 12
+#define GET_OPS 1
+#define SET_OPS 2
 uint64_t *global_workload_buf[MAX_TRACE];
+uint8_t *global_workload_ops_buf[MAX_TRACE]; //this stores corresponding ops
 uint64_t workload_len[MAX_TRACE];
 uint8_t workload_type[MAX_TRACE]; //1/22/2022
 uint64_t conn_init_index[MAX_TRACE];
@@ -124,7 +127,9 @@ enum conn_states {
     conn_sleeping,
     //junyaoy 12/20/2021
     //new state for setback purpose
-    conn_setback_reading
+    conn_setback_reading,
+    //mixed get set, could be based on both trace or probability
+    conn_getset_mix_reading
 };
 
 enum conn_rand {
@@ -147,10 +152,10 @@ typedef struct _mc_thread {
 // part of mc_thread.
 // TODO: Move more of the static values in here. counts/etc.
 typedef struct _mc_tshared {
-    size_t key_prefix_len;
     size_t cmd_postfix_len;
-    unsigned char key_prefix[284];
-    unsigned char second_key_prefix[284]; //this is used for setback //junyaoy 12/16/2021
+    //move to connection, want it to be different jy
+    // unsigned char key_prefix[284];
+    // unsigned char second_key_prefix[284]; //this is used for setback //junyaoy 12/16/2021
     unsigned char cmd_postfix[1024];
     unsigned char value[VALUE_MAX_SIZE];     /* manually specified seed value */
 } mc_tshared;
@@ -162,6 +167,10 @@ struct connection {
     /* some same-template shared data */
     mc_tshared *s;
 
+    //jy 03/02/2022 don't want to share get set ops
+    size_t key_prefix_len;
+    unsigned char key_prefix[284];
+    unsigned char second_key_prefix[284]; //this is used for setback //junyaoy 12/16/2021
     /* host */
     char host[NI_MAXHOST];
     char port_num[NI_MAXSERV];
@@ -201,6 +210,12 @@ struct connection {
     unsigned char *wbuf_pos;
     uint64_t workload_buf_index; //junyaoy 01/13/2022
     uint32_t workload_index;
+    
+    /*
+        This is used to control set/get ratio when get_and_set is enabled
+    */
+    uint32_t mixed_write_ratio; //junyaoy 03/02/2022
+    
     /* random number handling */
     pcg32_random_t rng; // every connection can have its own rng.
     enum conn_rand rand; // randomized options for run_counter().
@@ -236,8 +251,12 @@ struct connection {
 
 /*junyaoy 12/20/2021 modified prototype**/
 static void ascii_write_flat_to_client_noupdate(void *arg);
+static void ascii_write_flat_to_client_mixed(void *arg);
 static inline void run_setback_write(struct connection *c);
 static void setback_read_from_client(void *arg);
+
+static int ascii_set_format(struct connection *c);
+static int ascii_single_format(struct connection *c);
 
 static void client_handler(const int fd, const short which, void *arg);
 static void sleep_handler(const int fd, const short which, void *arg);
@@ -352,10 +371,33 @@ static inline void run_counter(struct connection *c) {
             break;
         case conn_rand_workload: //junyaoy 1/13/2022
             *c->cur_key = global_workload_buf[c->workload_index][c->workload_buf_index];
+            if (global_workload_ops_buf[c->workload_index] != NULL) {
+                if (global_workload_ops_buf[c->workload_index][c->workload_buf_index] == SET_OPS) 
+                {
+                    c->ascii_format = ascii_set_format;
+                    c->key_prefix[0] = 's';
+                }else {
+                    c->key_prefix[0] = 'g';
+                    c->ascii_format = ascii_single_format;
+                }
+                
+            }
             if (++c->workload_buf_index >= workload_len[c->workload_index]){
                 c->workload_buf_index = 0;
             }
             break;
+    }
+
+    if (c->mixed_write_ratio != 0) {
+        uint32_t p = pcg32_boundedrand_r(&c->rng, 100);
+        if (p < c->mixed_write_ratio) {
+            c->key_prefix[0]='s';
+            c->ascii_format = ascii_set_format;
+        } else {
+            c->key_prefix[0]='g';
+            c->ascii_format = ascii_single_format;
+        }
+    
     }
 }
 
@@ -396,8 +438,8 @@ static double zipf_calc_t(uint32_t n, double skew) {
 
 static int bin_key_format(struct connection *c) {
     char *p = c->wbuf_pos;
-    memcpy(p, c->s->key_prefix, c->s->key_prefix_len);
-    p = itoa_u64(*c->cur_key, p + c->s->key_prefix_len);
+    memcpy(p, c->key_prefix, c->key_prefix_len);
+    p = itoa_u64(*c->cur_key, p + c->key_prefix_len);
     return (p - (char *)c->wbuf_pos);
 }
 
@@ -486,8 +528,8 @@ static void bin_write_flat_to_client(void *arg) {
 
 static int ascii_mget_format(struct connection *c) {
     char *p = c->wbuf_pos;
-    memcpy(p, c->s->key_prefix, c->s->key_prefix_len);
-    p = itoa_u64(*c->cur_key, p + c->s->key_prefix_len);
+    memcpy(p, c->key_prefix, c->key_prefix_len);
+    p = itoa_u64(*c->cur_key, p + c->key_prefix_len);
     *p = ' ';
     return (p - (char *)c->wbuf_pos) + 1;
 }
@@ -513,8 +555,8 @@ static void ascii_write_flat_mget_to_client(void *arg) {
 
 static int ascii_set_format(struct connection *c) {
     char *p = c->wbuf_pos;
-    memcpy(p, c->s->key_prefix, c->s->key_prefix_len);
-    p = itoa_u64(*c->cur_key, p + c->s->key_prefix_len);
+    memcpy(p, c->key_prefix, c->key_prefix_len);
+    p = itoa_u64(*c->cur_key, p + c->key_prefix_len);
     *p = ' ';
     p = itoa_u32(c->flags, p+1);
     *p = ' ';
@@ -528,8 +570,8 @@ static int ascii_set_format(struct connection *c) {
 
 static int ascii_incrdecr_format(struct connection *c) {
     char *p = c->wbuf_pos;
-    memcpy(p, c->s->key_prefix, c->s->key_prefix_len);
-    p = itoa_u64(*c->cur_key, p + c->s->key_prefix_len);
+    memcpy(p, c->key_prefix, c->key_prefix_len);
+    p = itoa_u64(*c->cur_key, p + c->key_prefix_len);
     *p = ' ';
     *(p+1) = '1';
     *(p+2) = '\r';
@@ -539,8 +581,8 @@ static int ascii_incrdecr_format(struct connection *c) {
 
 static int ascii_touch_format(struct connection *c) {
     char *p = c->wbuf_pos;
-    memcpy(p, c->s->key_prefix, c->s->key_prefix_len);
-    p = itoa_u64(*c->cur_key, p + c->s->key_prefix_len);
+    memcpy(p, c->key_prefix, c->key_prefix_len);
+    p = itoa_u64(*c->cur_key, p + c->key_prefix_len);
     *p = ' ';
     p = itoa_u32(c->expire, p+1);
     *p = '\r';
@@ -551,9 +593,9 @@ static int ascii_touch_format(struct connection *c) {
 // get, delete, and so on.
 static int ascii_single_format(struct connection *c) {
     char *p = c->wbuf_pos;
-    memcpy(p, c->s->key_prefix, c->s->key_prefix_len);
+    memcpy(p, c->key_prefix, c->key_prefix_len);
     // printf("write: %c%c%c\n",p[0],p[1],p[2]);
-    p = itoa_u64(*c->cur_key, p + c->s->key_prefix_len);
+    p = itoa_u64(*c->cur_key, p + c->key_prefix_len);
     *p = ' ';
     *(p+1) = '\r';
     *(p+2) = '\n';
@@ -563,8 +605,8 @@ static int ascii_single_format(struct connection *c) {
 // meta commands: cmd key flags tokens
 static int ascii_metacmd_format(struct connection *c) {
     char *p = c->wbuf_pos;
-    memcpy(p, c->s->key_prefix, c->s->key_prefix_len);
-    p = itoa_u64(*c->cur_key, p + c->s->key_prefix_len);
+    memcpy(p, c->key_prefix, c->key_prefix_len);
+    p = itoa_u64(*c->cur_key, p + c->key_prefix_len);
     // now the flags/tokens
     if (c->s->cmd_postfix_len) {
         *p = ' ';
@@ -584,8 +626,8 @@ static int ascii_getset_format(struct connection *c) {
         //this is not a good check
         //consider buff per connection or use flag later
         char *p = c->wbuf_pos;
-        memcpy(p, c->s->second_key_prefix, c->s->key_prefix_len);
-        p = itoa_u64(*c->cur_key, p + c->s->key_prefix_len);
+        memcpy(p, c->second_key_prefix, c->key_prefix_len);
+        p = itoa_u64(*c->cur_key, p + c->key_prefix_len);
         *p = ' ';
         p = itoa_u32(c->flags, p+1);
         *p = ' ';
@@ -616,7 +658,23 @@ static void ascii_write_flat_to_client(void *arg) {
     }
     run_counter(c);
 }
-
+//junyaoy 3/02/2022 mixed
+static void ascii_write_flat_to_client_mixed(void *arg) {
+    struct connection *c = arg;
+    c->wbuf_pos += c->ascii_format(c);
+    if (c->value_size && c->ascii_format != ascii_single_format) {
+        if (c->use_shared_value) {
+            memcpy(c->wbuf_pos, c->t->shared_value, c->value_size);
+        } else {
+            memcpy(c->wbuf_pos, c->s->value, c->value_size);
+        }
+        c->wbuf_pos += c->value_size;
+        c->wbuf_pos[0] = '\r';
+        c->wbuf_pos[1] = '\n';
+        c->wbuf_pos += 2;
+    }
+    run_counter(c);
+}
 
 static void ascii_write_flat_to_client_noupdate(void *arg) {
     struct connection *c = arg;
@@ -908,6 +966,14 @@ static void client_handler(const int fd, const short which, void *arg) {
             
         }
         break;
+    case conn_getset_mix_reading:
+        c->reader(c);
+
+        c->state = conn_sending;
+        if (c->wbuf_towrite <= 0){
+            run_write(c);
+        }
+        break;
     }
 }
 
@@ -971,7 +1037,7 @@ static int new_connection(struct connection *t, char *sock_path)
 
     if (c->rand == conn_rand_workload) {
         c->workload_buf_index = conn_init_index[c->workload_index];
-        conn_init_index[c->workload_index] = conn_init_index[c->workload_index] + INDEX_INIT_INTERVAL % workload_len[c->workload_index];
+        conn_init_index[c->workload_index] = (conn_init_index[c->workload_index] + INDEX_INIT_INTERVAL) % workload_len[c->workload_index];
     }
 
     if (sock_path == NULL) {
@@ -1118,6 +1184,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
     char *workload_path_tmp;
     int workload_num = -1;
     char *latency_dump_path_tmp = NULL;
+    int workload_ops_tmp = 0;
 
     for (int i = 0; i < MAX_TRACE; i++) {
         if (global_workload_buf[i] == NULL) {
@@ -1156,10 +1223,12 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
         WORKLOAD_PATH, //junyaoy 1/13/2022
         WORKLOAD_LENGTH, //junyaoy 1/13/2022 if length is larger than workload, fit entire trace in to buffer.
         WORKLOAD_TYPE, //junyaoy 1/13/2022 handle separate trace type, mostly for later potential complex trace treament
+        WORKLOAD_OPS, //jy
         CPU_AFIN_PATH, //junyaoy /1/30/2022
         LATENCY_DUMP_PATH, //junyaoy 2/10/2022
         LATENCY_DUMP_LEN, //junyaoy 2/10/2022 dump len per connection
-        ZIPF_UNIQUE_CONN 
+        ZIPF_UNIQUE_CONN,
+        MIXED_WRITE_RATIO 
     };
 
     char *const key_options[] = {
@@ -1193,10 +1262,12 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
         [WORKLOAD_PATH]    = "workload_path", //Junyaoy 1/13/2022
         [WORKLOAD_LENGTH]  = "workload_length",
         [WORKLOAD_TYPE]    = "workload_type", //junyaoy see MACROs above
+        [WORKLOAD_OPS]     = "workload_ops", //yes means use real ops from the workload
         [CPU_AFIN_PATH]    = "cpu_afin_path",
         [LATENCY_DUMP_PATH] = "latency_dump_path", //junyaoy 2/10/2022
         [LATENCY_DUMP_LEN] =  "latency_dump_len", //junyaoy 2/10/2022 dump len per connection
         [ZIPF_UNIQUE_CONN] = "zipf_unique_conn",
+        [MIXED_WRITE_RATIO] = "mixed_write_ratio", //junyaoy 3/2/2022 used for get_and_set set ratio
         NULL
     };
 
@@ -1228,6 +1299,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
     template.latency_dump_fd = NULL;
     template.latency_dump_len = 0;
     template.zipf_unique_conn = 0;
+    template.mixed_write_ratio = 0;
 
     /* Chomp the ending newline */
     tmp = rindex(line, '\n');
@@ -1333,6 +1405,13 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
             //junyaoy 01/20/2022
             if (strcmp(value, "twitter") == 0) {
                 workload_type[workload_num] = TW_TYPE;
+            } else if (strcmp(value, "ibm") == 0) {
+                workload_type[workload_num] = IBM_TYPE;
+            }
+            break;
+        case WORKLOAD_OPS:
+            if (strcmp(value, "yes") == 0) {
+                workload_ops_tmp = 1;
             }
             break;
         case CPU_AFIN_PATH:
@@ -1348,6 +1427,13 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
             break;
         case ZIPF_UNIQUE_CONN:
             template.zipf_unique_conn = 1;
+            break;
+        case MIXED_WRITE_RATIO:
+            template.mixed_write_ratio = atoi(value);
+            if (template.mixed_write_ratio < 0 || template.mixed_write_ratio > 100){
+                perror("write ratio out of bound!\n");
+                exit(-1);
+            }  
         }
     }
     //collect latency to a file 02/10/2022 jy
@@ -1368,6 +1454,14 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
         if (global_workload_buf[workload_num] == NULL && workload_len[workload_num] != 0) {
             
             global_workload_buf[workload_num] = malloc(workload_len[workload_num]*sizeof(uint64_t));
+            if (workload_ops_tmp == 1 && workload_type[workload_num] == TW_TYPE) {
+                global_workload_ops_buf[workload_num] = malloc(workload_len[workload_num]*sizeof(uint8_t));
+                if (global_workload_ops_buf[workload_num] == NULL) {
+                    perror("global buffer ops allocation failed\n");
+                    exit(-1);
+                }
+            }
+            
             if (global_workload_buf[workload_num] == NULL) {
                 perror("global buffer allocation failed\n");
                 exit(-1);
@@ -1387,14 +1481,40 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
                 while((cnt < workload_len[workload_num]) &&
                       !tw_trace_finished(itr)) {
                     ref = tw_trace_next(itr);
+                    if (workload_ops_tmp == 1) {
+                        if (strcmp(ref->op, "get") == 0 //get
+                        || strcmp(ref->op, "gets") == 0) {
+                            global_workload_ops_buf[workload_num][cnt] = GET_OPS;
+                        } else if ( //set
+                            strcmp(ref->op, "set") == 0
+                        || strcmp(ref->op, "replace") == 0
+                        || strcmp(ref->op, "add") == 0
+                        || strcmp(ref->op, "cas") == 0
+                        || strcmp(ref->op, "append") == 0
+                        || strcmp(ref->op, "prepend") == 0
+                        || strcmp(ref->op, "incr") == 0
+                        || strcmp(ref->op, "decr") == 0
+                        || strcmp(ref->op, "delete") == 0) {
+                            global_workload_ops_buf[workload_num][cnt] = SET_OPS;
+                        } else {
+                            printf("command not recognized: %s\n",ref->op);
+                            exit(-1);
+                        }
+                    }
+
                     global_workload_buf[workload_num][cnt] = ref->murmur3_hashed_key[1];
                     cnt++;
                 }
+
+                workload_len[workload_num] = cnt;
+                printf("workload loading complete! ins:%llu\n",workload_len[workload_num]);
+                free(workload_path_tmp);
+                tw_trace_cleanUp(itr);
             }else {
                  //open new file, report error if failed
                 FILE* rfd;
                 if((rfd = fopen(workload_path_tmp,"r")) == NULL)
-                { perror("open error for read workload"); exit(-1); }
+                { perror("sim/ibm open error for read workload"); exit(-1); }
                 ssize_t read;
                 char* line = NULL;
                 size_t len = 0;
@@ -1406,8 +1526,14 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
                 while ( (cnt < workload_len[workload_num]) && 
                     ((read = getline(&line, &len, rfd)) != -1)) {
 
-                
-                    token = strtok(line, "\n");
+                    if (workload_type[workload_num] == IBM_TYPE) {
+                        token = strtok(line, " ");
+                        token = strtok(NULL, " ");
+                        token = strtok(NULL, " ");
+                    }else {
+                        token = strtok(line, "\n");
+                    }
+                    
                     raw_key = strdup(token); //dup the key
                     MurmurHash3_x64_128(raw_key,
                                         strlen(raw_key),
@@ -1417,7 +1543,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
                     global_workload_buf[workload_num][cnt] = murmur3_key[1];
                     cnt++;
                 }
-
+            
                 workload_len[workload_num] = cnt;
                 printf("workload loading complete! ins:%llu\n",workload_len[workload_num]);
                 free(workload_path_tmp);
@@ -1427,77 +1553,84 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
         }
         
     }
-   
-    if (strcmp(sender, "ascii_getset") == 0) {
+    if (strcmp(sender, "ascii_get_and_set") == 0) {
+
+        template.writer = ascii_write_flat_to_client_mixed;
+        template.ascii_format = ascii_single_format;
+        sprintf(template.key_prefix, "get %s", key_prefix_tmp);
+        sprintf(template.second_key_prefix, "set %s", key_prefix_tmp);
+        template.next_state = conn_getset_mix_reading;
+
+    } else if (strcmp(sender, "ascii_getset") == 0) {
         template.writer = ascii_write_flat_to_client_noupdate;
         template.ascii_format = ascii_single_format;
-        sprintf(template.s->key_prefix, "get %s", key_prefix_tmp);
-        sprintf(template.s->second_key_prefix, "set %s", key_prefix_tmp);
+        sprintf(template.key_prefix, "get %s", key_prefix_tmp);
+        sprintf(template.second_key_prefix, "set %s", key_prefix_tmp);
         template.reader = setback_read_from_client;
         template.next_state = conn_setback_reading;
     } else if (strcmp(sender, "ascii_get") == 0) {
         template.writer = ascii_write_flat_to_client;
         template.ascii_format = ascii_single_format;
-        sprintf(template.s->key_prefix, "get %s", key_prefix_tmp);
+        sprintf(template.key_prefix, "get %s", key_prefix_tmp);
     } else if (strcmp(sender, "ascii_set") == 0) {
         template.writer = ascii_write_flat_to_client;
         template.ascii_format = ascii_set_format;
-        sprintf(template.s->key_prefix, "set %s", key_prefix_tmp);
+        sprintf(template.key_prefix, "set %s", key_prefix_tmp);
     } else if (strcmp(sender, "ascii_mget") == 0) {
         template.writer = ascii_write_flat_mget_to_client;
-        sprintf(template.s->key_prefix, "%s", key_prefix_tmp);
+        sprintf(template.key_prefix, "%s", key_prefix_tmp);
     } else if (strcmp(sender, "ascii_incr") == 0) {
         template.writer = ascii_write_flat_to_client;
         template.ascii_format = ascii_incrdecr_format;
-        sprintf(template.s->key_prefix, "incr %s", key_prefix_tmp);
+        sprintf(template.key_prefix, "incr %s", key_prefix_tmp);
     } else if (strcmp(sender, "ascii_delete") == 0) {
         template.writer = ascii_write_flat_to_client;
         template.ascii_format = ascii_single_format;
-        sprintf(template.s->key_prefix, "delete %s", key_prefix_tmp);
+        sprintf(template.key_prefix, "delete %s", key_prefix_tmp);
     } else if (strcmp(sender, "ascii_decr") == 0) {
         template.writer = ascii_write_flat_to_client;
         template.ascii_format = ascii_incrdecr_format;
-        sprintf(template.s->key_prefix, "decr %s", key_prefix_tmp);
+        sprintf(template.key_prefix, "decr %s", key_prefix_tmp);
     } else if (strcmp(sender, "ascii_touch") == 0) {
         template.writer = ascii_write_flat_to_client;
         template.ascii_format = ascii_touch_format;
-        sprintf(template.s->key_prefix, "touch %s", key_prefix_tmp);
+        sprintf(template.key_prefix, "touch %s", key_prefix_tmp);
     } else if (strcmp(sender, "ascii_mg") == 0) {
         template.writer = ascii_write_flat_to_client;
         template.ascii_format = ascii_metacmd_format;
-        sprintf(template.s->key_prefix, "mg %s", key_prefix_tmp);
+        sprintf(template.key_prefix, "mg %s", key_prefix_tmp);
         sprintf(template.s->cmd_postfix, "%s", cmd_postfix_tmp);
     } else if (strcmp(sender, "bin_get") == 0) {
         template.writer = bin_write_flat_to_client;
         template.bin_prep_cmd = bin_prep_get;
         template.bin_format = bin_key_format;
-        strcpy(template.s->key_prefix, key_prefix_tmp);
+        strcpy(template.key_prefix, key_prefix_tmp);
     } else if (strcmp(sender, "bin_getq") == 0) {
         template.writer = bin_write_flat_to_client;
         template.bin_prep_cmd = bin_prep_getq;
         template.bin_format = bin_key_format;
-        strcpy(template.s->key_prefix, key_prefix_tmp);
+        strcpy(template.key_prefix, key_prefix_tmp);
     } else if (strcmp(sender, "bin_set") == 0) {
         template.writer = bin_write_flat_to_client;
         template.bin_prep_cmd = bin_prep_set;
         template.bin_format = bin_key_format;
-        strcpy(template.s->key_prefix, key_prefix_tmp);
+        strcpy(template.key_prefix, key_prefix_tmp);
     } else if (strcmp(sender, "bin_setq") == 0) {
         template.writer = bin_write_flat_to_client;
         template.bin_prep_cmd = bin_prep_setq;
         template.bin_format = bin_key_format;
-        strcpy(template.s->key_prefix, key_prefix_tmp);
+        strcpy(template.key_prefix, key_prefix_tmp);
     } else if (strcmp(sender, "bin_touch") == 0) {
         template.writer = bin_write_flat_to_client;
         template.bin_prep_cmd = bin_prep_touch;
         template.bin_format = bin_key_format;
-        strcpy(template.s->key_prefix, key_prefix_tmp);
+        strcpy(template.key_prefix, key_prefix_tmp);
     } else {
         fprintf(stderr, "Unknown command writer: %s\n", sender);
         exit(1);
     }
 
-    template.s->key_prefix_len = strlen(template.s->key_prefix);
+    template.key_prefix_len = strlen(template.key_prefix);
     template.s->cmd_postfix_len = strlen(template.s->cmd_postfix);
 
     if (new_thread != 0) {
@@ -1512,7 +1645,7 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
 
             FILE* cpu_rfd;
             if((cpu_rfd = fopen(cpu_afin_path,"r")) == NULL)
-            { perror("open error for read workload"); exit(-1); }
+            { printf(" cpu afin open error: %s\n", cpu_afin_path); exit(-1); }
             ssize_t read;
             char* line = NULL;
             size_t len = 0;
@@ -1658,6 +1791,7 @@ int main(int argc, char **argv)
     
     for (int i = 0; i < MAX_TRACE; i++) {
         global_workload_buf[i] = NULL; //junyaoy 01/13/2022
+        global_workload_ops_buf[i] = NULL;
         workload_len[i] = 0;
         workload_type[i] = SIM_TYPE; //default to preprocessed workload type
         conn_init_index[i] = 0;

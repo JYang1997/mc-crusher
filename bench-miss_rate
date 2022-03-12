@@ -9,6 +9,7 @@ use Time::HiRes;
 $|++;
 my $host        = shift @ARGV;
 my $filename    = shift @ARGV;
+my $value_size  = shift @ARGV;
 
 
 my $s = connect_to($host);
@@ -22,7 +23,8 @@ sub missrate {
     my $one = mc_info($s);
     my $max_mem = $one->{"limit_maxbytes"};
     my $missRate = $one->{"get_misses"} / ($one->{"get_hits"} + $one->{"get_misses"});
-    printf FH "%d, %.3f\n", $max_mem, $missRate;
+    # printf FH "%d, %.3f\n", $max_mem, $missRate;
+    printf FH "%d, %.3f\n", $max_mem / $value_size, $missRate;
 }
 
 sub mc_info {
@@ -38,6 +40,7 @@ sub mc_info {
     return \%stats;
 }
 
+
 sub connect_to {
-    return IO::Socket::INET->new(PeerAddr => $_[0], Timeout => 3);
+    return IO::Socket::INET->new(PeerAddr => $_[0], Timeout => 10);
 }
