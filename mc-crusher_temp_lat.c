@@ -86,12 +86,6 @@
 #define IBM_TYPE 4
 //junyaoy 2/12/2022
 #define LAT_WARM_CNT 100000
-
-//jy
-//default option use fixed expire from expire field
-#define EXPIRE_CONST 1 
-#define EXPIRE_VAR 2
-
 // avoiding some hacks for finding member size.
 #define SOCK_MAX 100
 
@@ -121,7 +115,6 @@ pthread_mutex_t exit_lock;
 
 //junyaoy 2/12/2022 use to protect append to latency file
 pthread_mutex_t lat_append_lock;
-
 
 #ifdef USE_TLS
 SSL_CTX *global_ctx;
@@ -206,10 +199,6 @@ struct connection {
     /*junyaoy 
       for setback purpose, record hit or miss*/
     int read_info;
-
-    //jy 09/21/2022
-    int expire_option;
-    
 
     uint64_t pipelines; /* number of repeated commands per write */
     int usleep; /* us to sleep between write runs */
@@ -567,9 +556,6 @@ static void ascii_write_flat_mget_to_client(void *arg) {
 
 
 
-static int expire_gen(struct connection *c) {
-    return c->expire;
-}
 
 static int ascii_set_format(struct connection *c) {
     char *p = c->wbuf_pos;
@@ -578,14 +564,7 @@ static int ascii_set_format(struct connection *c) {
     *p = ' ';
     p = itoa_u32(c->flags, p+1);
     *p = ' ';
-//
-    if (c->expire_option == EXPIRE_CONST) {
-        p = itoa_u32(c->expire, p+1);
-    } else {
-        p = itoa_u32(expire_gen(c), p+1);
-    }
-//
-   
+    p = itoa_u32(c->expire, p+1);
     *p = ' ';
     p = itoa_u32(c->value_size, p+1);
     *p = '\r';
@@ -739,9 +718,7 @@ static void read_from_client(void *arg) {
 
         if (rbytes == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                perror("EAGAIN, EWOULDBLOCK\n");
                 exit(-1);
-                // sleep(10000);
                 break;
             } else {
                 perror("Read error from client");
@@ -872,10 +849,14 @@ static void setback_read_from_client(void *arg) {
                 //02/12/2022 jy store latency if hit
                 struct timeval et;
                 gettimeofday(&et, NULL);
-                if (*(c->write_count) > LAT_WARM_CNT && c->latency_curr_index < c->latency_dump_len) { 
-                    c->resp_times[c->latency_curr_index]= ((et.tv_sec - (c->st).tv_sec) * 1000000) + (et.tv_usec - (c->st).tv_usec);
+                if(((et.tv_sec - (c->st).tv_sec)) >= 1) {
+                    c->resp_times[c->latency_curr_index]= (((et.tv_sec - (c->st).tv_sec) * 1000000) + (et.tv_usec - (c->st).tv_usec)) / *(c->write_count);
                     c->latency_curr_index++;
                 }
+                // if (*(c->write_count) > LAT_WARM_CNT && c->latency_curr_index < c->latency_dump_len) { 
+                //     c->resp_times[c->latency_curr_index]= ((et.tv_sec - (c->st).tv_sec) * 1000000) + (et.tv_usec - (c->st).tv_usec);
+                //     c->latency_curr_index++;
+                // }
             }
             memset(c->rbuf,0,(size_t)RBUF_SIZE);
             break;
@@ -914,7 +895,6 @@ static inline void run_write(struct connection *c) {
         c->writer(c);
     //    printf("write: %.100sdone\n",c->wbuf);
     }
-    // printf("write: %.1000sdone\n",c->wbuf);
     {
         // not using iovecs, save some libc/kernel looping.
         c->wbuf_towrite = c->wbuf_pos - (unsigned char *)&c->wbuf;
@@ -922,7 +902,7 @@ static inline void run_write(struct connection *c) {
         //fprintf(stderr, "WBUF towrite: %d\n", c->wbuf_towrite);
         write_flat(c, c->next_state);
     }
-    if (c->stop_after && *c->write_count >= c->stop_after) {
+    if (c->stop_after && c->latency_curr_index >= c->latency_dump_len) {
         //dump out latency to the specified file
         //protect it, just to makesure append to file works properly
         pthread_mutex_lock(&lat_append_lock);
@@ -992,10 +972,6 @@ static void client_handler(const int fd, const short which, void *arg) {
             //setback
 
             //set a penalty time, if current time is less then penalty time don't fire
-            
-            //temp delay
-            int rt = 100 + pcg32_boundedrand_r(&c->rng, 200);
-            usleep(rt);
             run_setback_write(c);
             
         }
@@ -1234,7 +1210,6 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
         COUNT,
         CONNS,
         EXPIRE,
-        EXPIRE_OPTION, //jy 
         FLAGS,
         KEY_PREFIX,
         CMD_POSTFIX,
@@ -1274,7 +1249,6 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
         [COUNT]            = "count",
         [CONNS]            = "conns",
         [EXPIRE]           = "expire",
-        [EXPIRE_OPTION]    = "expire_option",
         [FLAGS]            = "flags",
         [KEY_PREFIX]       = "key_prefix",
         [CMD_POSTFIX]      = "cmd_postfix",
@@ -1336,7 +1310,6 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
     template.latency_dump_len = 0;
     template.zipf_unique_conn = 0;
     template.mixed_write_ratio = 0;
-    template.expire_option = EXPIRE_CONST; 
 
     /* Chomp the ending newline */
     tmp = rindex(line, '\n');
@@ -1373,11 +1346,6 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
         case EXPIRE:
             // TODO: import strtoul wrappers
             template.expire = atoi(value);
-            break;
-        case EXPIRE_OPTION:
-            if (strcmp(value, "var") == 0) {
-                template.expire_option = EXPIRE_VAR;
-            }
             break;
         case FLAGS:
             template.flags = atoi(value);
@@ -1547,12 +1515,6 @@ static void parse_config_line(mc_thread *main_thread, char *line, bool use_sock)
                     global_workload_buf[workload_num][cnt] = ref->murmur3_hashed_key[1];
                     cnt++;
                 }
-                //temp solution
-                // set first instruction to get, to activate the buffer in memcached
-                if (workload_ops_tmp == 1) {
-                    global_workload_ops_buf[workload_num][0] = GET_OPS; 
-                }
-                
 
                 workload_len[workload_num] = cnt;
                 printf("workload loading complete! ins:%llu\n",workload_len[workload_num]);
@@ -1782,7 +1744,6 @@ static void setup_thread(mc_thread *t) {
     }
     t->cpu_num = -1; //junyaoy
     t->shared_value = calloc(SHARED_VALUE_SIZE, sizeof(unsigned char));
-    memset(t->shared_value, 65, SHARED_VALUE_SIZE);
     t->shared_rbuf = calloc(SHARED_RBUF_SIZE, sizeof(unsigned char));
 }
 
@@ -1922,15 +1883,8 @@ int main(int argc, char **argv)
         pcg32_random_t rng;
         pcg32_srandom_r(&rng, time(NULL), 54u);
         double zipf_t = zipf_calc_t(zipf_n, zipf_s);
-        for (x = 1; x <= 100000000; x++) {
-            if (x % 30000000 == 0) {
-                for (int y = 0; y < 500000; y++){
-                    fprintf(stdout, "scanpattern:%d\n", y);
-                }
-                
-            }
+        for (x = 0; x < 100000000; x++) {
             fprintf(stdout, "%u\n", zipf_sample(&rng, zipf_t, zipf_s));
-
         }
         exit(1);
     }
