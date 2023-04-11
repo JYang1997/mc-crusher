@@ -1,1 +1,3 @@
 cpu_afin*
+*.data
+*.data.txt

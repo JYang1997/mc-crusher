@@ -327,6 +327,7 @@ static void write_flat(struct connection *c, enum conn_states next_state) {
     written = SSL_write(c->ssl, c->wbuf + c->wbuf_written, c->wbuf_towrite);
 #else
     written = write(c->fd, c->wbuf + c->wbuf_written, c->wbuf_towrite);
+
 #endif
     if (written == -1) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -372,7 +373,12 @@ static inline void run_counter(struct connection *c) {
             }
             break;
         case conn_rand_uniform:
-            *c->cur_key = pcg32_boundedrand_r(&c->rng, c->key_count);
+            // *c->cur_key = pcg32_boundedrand_r(&c->rng, c->key_count);
+
+            if (++*c->cur_key >= c->key_count) {
+                //fprintf(stdout, "Did %llu writes\n", (unsigned long long)c->key_count);
+                *c->cur_key = 0;
+            }
 
             if (c->zipf_unique_conn == 1) { //jy 2/14/2022 make key unique to each conn
                 *c->cur_key = c->t->thread_id << 42 | (uint64_t)c->conn_id << 33 | *c->cur_key;
@@ -797,6 +803,7 @@ static inline void run_setback_write(struct connection *c) {
                 written = SSL_write(c->ssl, c->wbuf + c->wbuf_written, c->wbuf_towrite);
             #else   
                 written = write(c->fd, c->wbuf + c->wbuf_written, c->wbuf_towrite);
+                
             #endif
 
 
@@ -925,11 +932,13 @@ static inline void run_write(struct connection *c) {
     if (c->stop_after && *c->write_count >= c->stop_after) {
         //dump out latency to the specified file
         //protect it, just to makesure append to file works properly
-        pthread_mutex_lock(&lat_append_lock);
-        for (int i = 0; i<c->latency_curr_index; i++) {
-            fprintf(c->latency_dump_fd, "%d\n", c->resp_times[i]);
+        if (c->latency_dump_fd != NULL) {
+            pthread_mutex_lock(&lat_append_lock);
+            for (int i = 0; i<c->latency_curr_index; i++) {
+                fprintf(c->latency_dump_fd, "%d\n", c->resp_times[i]);
+            }
+            pthread_mutex_unlock(&lat_append_lock);
         }
-        pthread_mutex_unlock(&lat_append_lock);
         event_del(&c->ev);
     }
 }

@@ -46,14 +46,20 @@ sub sample {
     $runs++;
 
     for my $stat (@TO_SAMPLE) {
-        my $per_sec = ($two->{$stat} - $one->{$stat}) / $elapsed;
-        if (!$avgs{$stat}) {
-            $avgs{$stat} = $per_sec;
+        if ($stat eq "bytes" or $stat eq "reclaimed" or $stat eq "crawler_reclaimed") {
+            printf "%-${longest}s avg/s (%2s/s sample): %-20s [%s]\n", $stat,
+            $SAMPLE_TIME, $two->{$stat}, $two->{$stat};
         } else {
-            $avgs{$stat} += $per_sec;
+            my $per_sec = ($two->{$stat} - $one->{$stat}) / $elapsed;
+            if (!$avgs{$stat}) {
+                $avgs{$stat} = $per_sec;
+            } else {
+                $avgs{$stat} += $per_sec;
+            }
+            printf "%-${longest}s avg/s (%2s/s sample): %-20s [%s]\n", $stat,
+            $SAMPLE_TIME, $per_sec, $avgs{$stat} / $runs;
         }
-        printf "%-${longest}s avg/s (%2s/s sample): %-20s [%s]\n", $stat,
-        $SAMPLE_TIME, $per_sec, $avgs{$stat} / $runs;
+
     }
 }
 
